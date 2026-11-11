@@ -39,12 +39,15 @@ gh api -X PUT "repos/$REPO/actions/oidc/customization/sub" --input - <<'JSON' >/
 { "use_default": false, "include_claim_keys": ["repo", "context", "job_workflow_ref"] }
 JSON
 
-SUBJECT="repo:$REPO:environment:$ENV_NAME:job_workflow_ref:$WORKFLOW_REF"
+PREFIX=$(gh api "repos/$REPO/actions/oidc/customization/sub" --jq ".sub_claim_prefix // \"repo:$REPO\"")
+SUBJECT="$PREFIX:environment:$ENV_NAME:job_workflow_ref:$WORKFLOW_REF"
 FIC_NAME="gh-$(echo "$REPO" | tr '/A-Z' '-a-z' | tr -cd 'a-z0-9-')-$ENV_NAME"
 echo "==> federated credential '$FIC_NAME'"
 echo "    subject: $SUBJECT"
 if az ad app federated-credential show --id "$CLIENT_ID" --federated-credential-id "$FIC_NAME" >/dev/null 2>&1; then
-  echo "    (already exists)"
+  az ad app federated-credential update --id "$CLIENT_ID" --federated-credential-id "$FIC_NAME" \
+    --parameters "{\"subject\":\"$SUBJECT\"}" >/dev/null
+  echo "    (updated)"
 else
   tmp=$(mktemp)
   cat >"$tmp" <<JSON
