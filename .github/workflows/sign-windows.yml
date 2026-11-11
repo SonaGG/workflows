@@ -1,0 +1,153 @@
+name: Sign Windows binaries
+
+on:
+  workflow_call:
+    inputs:
+      artifact-name:
+        description: Artifact holding the files to sign.
+        required: true
+        type: string
+      files-filter:
+        description: Comma-separated extensions to sign.
+        required: false
+        type: string
+        default: exe,dll,sys,msi,msix,appx,cab,cat,ps1,psm1
+      replace-artifact:
+        description: Re-upload under the same name instead of "<artifact-name>-signed".
+        required: false
+        type: boolean
+        default: true
+      description:
+        description: Signature description.
+        required: false
+        type: string
+        default: ''
+      description-url:
+        description: Signature description URL.
+        required: false
+        type: string
+        default: ''
+    outputs:
+      signed-artifact-name:
+        description: Artifact holding the signed files.
+        value: ${{ jobs.sign.outputs.signed-artifact-name }}
+
+permissions: {}
+
+jobs:
+  guard:
+    name: Check trigger
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Check trigger
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_TYPE: ${{ github.ref_type }}
+          OWNER: ${{ github.repository_owner }}
+          IS_FORK: ${{ github.event.repository.fork }}
+        run: |
+          set -eu
+          fail() { echo "::error title=Signing refused::$1"; exit 1; }
+          case "$EVENT" in
+            push|release|workflow_dispatch) ;;
+            *) fail "event '$EVENT' is not allowed." ;;
+          esac
+          [ "$OWNER" = "SonaGG" ]  || fail "owner '$OWNER' is not allowed."
+          [ "$IS_FORK" != "true" ] || fail "forks are not allowed."
+          [ "$REF_TYPE" = "tag" ]  || fail "ref '$REF' is not a tag."
+          case "$REF" in
+            refs/tags/v*) ;;
+            *) fail "tag '$REF' is not a release tag." ;;
+          esac
+
+  sign:
+    name: Sign ${{ inputs.artifact-name }}
+    needs: guard
+    runs-on: windows-latest
+    environment: code-signing
+    permissions:
+      id-token: write
+    outputs:
+      signed-artifact-name: ${{ steps.name.outputs.value }}
+    steps:
+      - name: Download
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ runner.temp }}\to-sign
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.ARTIFACT_SIGNING_CLIENT_ID }}
+          tenant-id: ${{ vars.ARTIFACT_SIGNING_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Sign
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+          files-folder: ${{ runner.temp }}\to-sign
+          files-folder-filter: ${{ inputs.files-filter }}
+          files-folder-recurse: true
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          description: ${{ inputs.description }}
+          description-url: ${{ inputs.description-url }}
+          exclude-environment-credential: true
+          exclude-azure-cli-credential: false
+          cache-dependencies: false
+
+      - name: Verify
+        shell: pwsh
+        env:
+          ROOT: ${{ runner.temp }}\to-sign
+          FILTER: ${{ inputs.files-filter }}
+          ARTIFACT: ${{ inputs.artifact-name }}
+        run: |
+          $exts = $env:FILTER.Split(',') | ForEach-Object { '.' + $_.Trim().TrimStart('*').TrimStart('.').ToLowerInvariant() }
+          $files = Get-ChildItem -LiteralPath $env:ROOT -Recurse -File | Where-Object { $exts -contains $_.Extension.ToLowerInvariant() }
+          if (-not $files) {
+            Write-Output "::error title=Nothing signed::No files matching '$env:FILTER' in artifact '$env:ARTIFACT'."
+            exit 1
+          }
+          $bad = 0
+          foreach ($f in $files) {
+            $sig = Get-AuthenticodeSignature -LiteralPath $f.FullName
+            $rel = $f.FullName.Substring($env:ROOT.Length).TrimStart('\')
+            if ($sig.Status -ne 'Valid' -or -not $sig.TimeStamperCertificate) {
+              Write-Output "::error title=Bad signature::$rel -> $($sig.Status) $($sig.StatusMessage) (timestamped: $([bool]$sig.TimeStamperCertificate))"
+              $bad++
+            } else {
+              Write-Output "signed  $rel  [$($sig.SignerCertificate.Subject)]"
+            }
+          }
+          if ($bad) { exit 1 }
+
+      - name: Azure logout
+        if: always()
+        shell: pwsh
+        run: az logout; az account clear
+
+      - name: Resolve artifact name
+        id: name
+        shell: pwsh
+        env:
+          ARTIFACT: ${{ inputs.artifact-name }}
+          REPLACE: ${{ inputs.replace-artifact }}
+        run: |
+          $name = if ($env:REPLACE -eq 'true') { $env:ARTIFACT } else { "$($env:ARTIFACT)-signed" }
+          "value=$name" >> $env:GITHUB_OUTPUT
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.name.outputs.value }}
+          path: ${{ runner.temp }}\to-sign
+          if-no-files-found: error
+          overwrite: ${{ inputs.replace-artifact }}
